@@ -26,7 +26,10 @@ This is a personal working record. It's public to read, but contributions aren't
 │   ├── 03-github-actions.md      ← how GitHub workflows execute
 │   ├── 04-workflow-review.md     ← line-by-line review of v2 and the fixes
 │   ├── 05-decisions.md           ← decision log (why the pipeline looks like this)
-│   └── diagrams.md               ← Mermaid diagrams (render natively on GitHub)
+│   ├── 06-job-reference.md       ← what each job does, permissions, failure modes
+│   ├── 07-scenarios.md           ← how far a commit gets in common situations
+│   ├── diagrams.md               ← illustrations + Mermaid diagrams
+│   └── visuals/                  ← SVG flowcharts (light/dark aware)
 ├── plans/
 │   └── 2026-11-25-cicd-pipeline-plan.md
 ├── workflows/
@@ -42,15 +45,9 @@ This is a personal working record. It's public to read, but contributions aren't
 
 ## Pipeline at a glance
 
-```mermaid
-flowchart LR
-    T[push] --> B[build]
-    B --> TE[test]
-    B --> S[scan]
-    TE --> ST[deploy-staging<br/>main only]
-    S --> ST
-    ST -. manual: Run workflow<br/>promote_to_production .-> P[deploy-prod]
-```
+![v4 overall flow](docs/visuals/01-overall-flow.svg)
+
+Mermaid versions and more diagrams: [`docs/diagrams.md`](docs/diagrams.md).
 
 ## Using the workflow in a project repo
 

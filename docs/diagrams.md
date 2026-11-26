@@ -1,6 +1,18 @@
 # Diagrams
 
-Mermaid sources; GitHub renders them inline.
+Illustrations (SVG, adapt to light/dark mode) followed by Mermaid sources; GitHub renders both inline.
+
+## Illustrations
+
+| | |
+|---|---|
+| **v4 overall flow** — push path vs manual promotion | ![Overall flow](visuals/01-overall-flow.svg) |
+| **Build once, promote many** — one SHA-tagged image through every stage | ![Image promotion](visuals/02-image-promotion.svg) |
+| **Test job evidence pattern** — evidence first, verdict last | ![Test evidence pattern](visuals/03-test-evidence-pattern.svg) |
+
+Per-job details: [`06-job-reference.md`](06-job-reference.md). Scenario walk-through: [`07-scenarios.md`](07-scenarios.md).
+
+## Mermaid sources
 
 ## 1. Pipeline overview
 
