@@ -1,0 +1,85 @@
+# .github/workflows/ci-cd.yml   (v1 – original teaching example, 2026-11-22)
+# Pipeline: build -> (test || scan) -> staging -> prod (approval-gated)
+# Superseded: see workflows/ci-cd.yml and docs/04-workflow-review.md
+name: ci-cd
+
+on:
+  push:
+    # CI on every push to working branches; CD only acts on main (see `if:` below).
+    # Status checks attach to the commit SHA, so these push runs also satisfy
+    # required checks on the PR -- no duplicate pull_request run needed.
+    branches: [main, "dev-*", "fix-*"]
+  workflow_dispatch: {}            # manual re-run button
+
+permissions:
+  contents: read                   # least privilege by default; jobs widen as needed
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true         # a newer push cancels the stale run on the same branch
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write              # push image to GHCR
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      # GHCR requires lowercase; tag by commit SHA so the SAME artifact is promoted
+      - id: meta
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          push: true
+          tags: ${{ steps.meta.outputs.image }}
+          cache-from: type=gha       # layer cache keeps rebuilds fast
+          cache-to: type=gha,mode=max
+
+  test:
+    needs: build                   # runs in parallel with scan
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: read }
+    steps:
+      - uses: docker/login-action@v3
+        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
+      # Test inside the built image -- validates the artifact, not just the source
+      - run: docker run --rm "${{ needs.build.outputs.image }}" pytest -q
+
+  scan:
+    needs: build                   # runs in parallel with test
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: read }
+    steps:
+      - uses: docker/login-action@v3
+        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
+      - run: docker pull "${{ needs.build.outputs.image }}"
+      # Fail the run on HIGH/CRITICAL CVEs. Pin a Trivy version instead of :latest in real use.
+      - run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest \
+            image --exit-code 1 --severity HIGH,CRITICAL "${{ needs.build.outputs.image }}"
+
+  deploy-staging:
+    needs: [build, test, scan]     # `build` listed directly so its outputs are readable here
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/deploy.sh staging "${{ needs.build.outputs.image }}"   # your deploy mechanism
+
+  deploy-prod:
+    needs: [build, deploy-staging]
+    runs-on: ubuntu-latest
+    environment: production        # required reviewers set in Settings -> Environments = the amber gate
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/deploy.sh production "${{ needs.build.outputs.image }}"

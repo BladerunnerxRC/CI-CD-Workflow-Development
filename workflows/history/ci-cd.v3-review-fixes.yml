@@ -1,0 +1,356 @@
+# .github/workflows/ci-cd.yml
+#
+# Pipeline:
+#   build ──┬── test ──┬── deploy-staging ── deploy-prod (approval-gated)
+#           └── scan ──┘
+#   test ────── publish-test-report (main only → GitHub Pages)
+#
+# REQUIRES a multi-stage Dockerfile with two named stages:
+#   runtime – the production image (no test tooling)
+#   test    – FROM runtime, adds pytest + pytest-html + tests/
+#
+# Supply-chain TODO: pin every `uses:` to a full commit SHA and the Trivy image
+# to a digest (see TRIVY_IMAGE in the scan job).
+
+name: ci-cd
+
+on:
+  push:
+    # CI on every push to working branches; CD jobs act on main only.
+    # No pull_request trigger: checks attach to the commit SHA, so these push
+    # runs satisfy the PR's required checks without a duplicate run.
+    branches:
+      - main
+      - "dev-*"
+      - "fix-*"
+  workflow_dispatch:
+
+# Least privilege at the top; each job grants only what it needs.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Cancel stale runs on branches, but never interrupt a main run mid-deploy.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  # ───────────────────────────── CI ─────────────────────────────
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write                     # push images to GHCR
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      test_image: ${{ steps.meta.outputs.test_image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # GHCR requires lowercase. The SHA tag is the immutable "lot number":
+      # this exact image is what gets scanned, staged, and promoted to prod.
+      - name: Compute image names
+        id: meta
+        run: |
+          base="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "image=${base}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "test_image=${base}:${GITHUB_SHA}-test" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Production image: no test tooling, with SBOM + full build provenance attached.
+      - name: Build and push runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          push: true
+          tags: ${{ steps.meta.outputs.image }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha,scope=runtime
+          cache-to: type=gha,scope=runtime,mode=max
+
+      # Test image: runtime + test deps. Reuses runtime layers from cache.
+      - name: Build and push test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: test
+          push: true
+          tags: ${{ steps.meta.outputs.test_image }}
+          provenance: false
+          cache-from: |
+            type=gha,scope=runtime
+            type=gha,scope=test
+          cache-to: type=gha,scope=test,mode=max
+
+  test:
+    needs: build                          # runs in parallel with scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read                      # pull test image
+      checks: write                       # publish-unit-test-result: create check run
+      pull-requests: write                # publish-unit-test-result: PR comment
+      issues: read                        # publish-unit-test-result: required in private repos
+    outputs:
+      artifact_url: ${{ steps.upload.outputs.artifact-url }}
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create results directory
+        run: mkdir -p test-results
+
+      # continue-on-error keeps the job alive so evidence is published even on
+      # failure; the final step re-fails the job if tests failed.
+      - name: Run tests
+        id: pytest
+        continue-on-error: true
+        env:
+          TEST_IMAGE: ${{ needs.build.outputs.test_image }}
+        run: |
+          # --user: write results as the runner's uid (mounted dir is runner-owned)
+          # HOME=/tmp: that uid may have no home dir inside the image
+          # -p no:cacheprovider: don't try to write .pytest_cache into the image's workdir
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp \
+            -v "$PWD/test-results:/results" \
+            "$TEST_IMAGE" \
+            pytest -q \
+              -p no:cacheprovider \
+              --junitxml=/results/junit.xml \
+              --html=/results/report.html \
+              --self-contained-html
+
+      - name: Publish test results
+        if: ${{ !cancelled() }}
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        with:
+          files: test-results/junit.xml
+          check_name: Test results
+
+      - name: Upload test reports
+        id: upload
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: test-results/
+          if-no-files-found: warn
+          retention-days: 30
+
+      # Gives every branch run a link to its evidence (Pages is main-only).
+      - name: Link reports in run summary
+        if: ${{ !cancelled() && steps.upload.outputs.artifact-url != '' }}
+        env:
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+        run: |
+          {
+            echo "### Test evidence"
+            echo
+            echo "- Reports (report.html, junit.xml): ${ARTIFACT_URL}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail if tests failed
+        if: steps.pytest.outcome == 'failure'
+        run: |
+          echo "::error::pytest reported failures. See the Test results check and the test-reports artifact."
+          exit 1
+
+  scan:
+    needs: build                          # runs in parallel with test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read                      # pull runtime image
+    env:
+      IMAGE: ${{ needs.build.outputs.image }}
+      # Confirm this tag exists (docker manifest inspect), then append
+      # @sha256:<digest> so a repointed tag can't swap the scanner.
+      TRIVY_IMAGE: aquasec/trivy:0.70.0
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull image under test
+        run: docker pull "$IMAGE"
+
+      - name: Create results directory
+        run: mkdir -p scan-results
+
+      # Evidence first: full SARIF report, all severities, never fails the job.
+      # The named volume caches the vuln DB for the gate step below.
+      - name: Generate SARIF report
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v trivy-cache:/root/.cache/ \
+            -v "$PWD/scan-results:/out" \
+            "$TRIVY_IMAGE" image \
+              --exit-code 0 \
+              --format sarif \
+              --output /out/trivy.sarif \
+              "$IMAGE"
+
+      # Gate: human-readable table in the log, fails on HIGH/CRITICAL.
+      - name: Gate on HIGH/CRITICAL vulnerabilities
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v trivy-cache:/root/.cache/ \
+            "$TRIVY_IMAGE" image \
+              --skip-db-update \
+              --exit-code 1 \
+              --severity HIGH,CRITICAL \
+              "$IMAGE"
+
+      - name: Upload scan report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-results
+          path: scan-results/
+          if-no-files-found: warn
+          retention-days: 30
+
+  # Publishes the latest main-branch test report to GitHub Pages.
+  # Runs on test pass OR fail (so failures are visible), never on cancel/skip.
+  # NOTE: on non-Enterprise plans the Pages site is public even for private repos.
+  publish-test-report:
+    needs: test
+    if: ${{ !cancelled() && needs.test.result != 'skipped' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write                        # deploy to Pages
+      id-token: write                     # Pages verifies the deployment's origin via OIDC
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Download test reports
+        uses: actions/download-artifact@v4
+        with:
+          name: test-reports
+          path: site
+
+      # Landing page so the site root isn't a 404.
+      - name: Add index page
+        run: |
+          cat > site/index.html <<EOF
+          <!doctype html>
+          <html><head><meta charset="utf-8"><title>Test reports</title></head>
+          <body>
+            <h1>Test reports</h1>
+            <p>Commit ${GITHUB_SHA} &middot; run ${GITHUB_RUN_ID}</p>
+            <ul>
+              <li><a href="report.html">report.html</a> (pytest-html)</li>
+              <li><a href="junit.xml">junit.xml</a> (JUnit)</li>
+            </ul>
+          </body></html>
+          EOF
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
+
+      - name: Add report links to run summary
+        env:
+          PAGE_URL: ${{ steps.deploy.outputs.page_url }}
+          ARTIFACT_URL: ${{ needs.test.outputs.artifact_url }}
+        run: |
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          SITE="${PAGE_URL%/}"            # page_url ends in "/"; strip to avoid "//"
+          {
+            echo "## Test reports"
+            echo
+            echo "- Published report: ${SITE}/report.html"
+            echo "- Workflow run: ${RUN_URL}"
+            echo "- Report artifact: ${ARTIFACT_URL}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ───────────────────────────── CD ─────────────────────────────
+  deploy-staging:
+    needs: [build, test, scan]            # build listed so its outputs are readable
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # id-token: write                   # uncomment only if deploy.sh uses OIDC
+    environment: staging
+    concurrency:
+      group: deploy-staging               # one staging deploy at a time, across runs
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to staging
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+        run: ./scripts/deploy.sh staging "$IMAGE"
+
+      # Proves the service actually came up, not just that deploy.sh exited 0.
+      # Set repo variable STAGING_URL to enable; skipped if unset.
+      - name: Smoke test
+        if: vars.STAGING_URL != ''
+        env:
+          BASE_URL: ${{ vars.STAGING_URL }}
+        run: curl -fsS --retry 10 --retry-delay 6 --retry-all-errors "${BASE_URL%/}/health"
+
+  deploy-prod:
+    needs: [build, deploy-staging]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # id-token: write                   # uncomment only if deploy.sh uses OIDC
+    # The approval gate = required reviewers on this environment
+    # (Settings → Environments → production). On Free/Pro/Team plans that rule
+    # only exists for PUBLIC repos; on a private repo this job runs ungated.
+    environment: production
+    concurrency:
+      group: deploy-production            # serialize prod deploys; never cancel one mid-flight
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to production
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+        run: ./scripts/deploy.sh production "$IMAGE"
+
+      # Set repo variable PROD_URL to enable; skipped if unset.
+      - name: Smoke test
+        if: vars.PROD_URL != ''
+        env:
+          BASE_URL: ${{ vars.PROD_URL }}
+        run: curl -fsS --retry 10 --retry-delay 6 --retry-all-errors "${BASE_URL%/}/health"
