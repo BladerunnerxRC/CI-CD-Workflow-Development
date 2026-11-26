@@ -1,0 +1,30 @@
+# Multi-stage Dockerfile expected by workflows/ci-cd.yml
+# The build job builds two targets from this one file:
+#   runtime -> the production image (scanned, staged, promoted)
+#   test    -> runtime + test tooling (used only by the test job, never deployed)
+
+# ---------- runtime: what ships ----------
+FROM python:3.12-slim AS runtime
+WORKDIR /app
+
+# Install runtime dependencies first so this layer caches across code changes
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY src/ ./src/
+
+# Non-root user (the workflow's test job runs as the runner uid, so this is safe)
+RUN useradd --create-home --uid 10001 app
+USER app
+
+CMD ["python", "-m", "src.main"]
+
+# ---------- test: never reaches production ----------
+FROM runtime AS test
+USER root
+# requirements-dev.txt: pytest, pytest-html
+# (Dockerfile comments must be on their own line; a trailing "#" would be read as a COPY source)
+COPY requirements-dev.txt .
+RUN pip install --no-cache-dir -r requirements-dev.txt
+COPY tests/ ./tests/
+USER app
