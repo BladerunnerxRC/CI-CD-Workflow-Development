@@ -4,6 +4,22 @@ Lightweight decision records. Newest first. Status: **Accepted**, **Proposed**, 
 
 ---
 
+## D-009 — Stay on GitHub Actions; Gitea not adopted (Accepted, 2026-11-26)
+
+**Context.** Evaluated whether `ci-cd.yml` v4 would run on Gitea Actions. The YAML structure,
+`needs:`, outputs, `workflow_dispatch` inputs, `vars`, job `permissions:` and (Gitea 1.26+)
+`concurrency:` carry over. These do not: `environment:` (ignored), GHCR push with the job token
+(Gitea's token can't publish to its own registry), Checks API (test-result check and gate 1),
+GitHub Pages, stock `upload-artifact@v4`, `type=gha` build cache, and `docker run -v $PWD`
+bind mounts inside containerized `act_runner` jobs (evidence lands on the wrong path).
+
+**Decision.** Stay on GitHub (hosted repos + Actions), with work done in a local clone.
+No Gitea variant of the workflow will be maintained.
+
+**Consequences.** + One workflow, one platform, no compatibility shims. − Private-repo limits
+remain (no environment reviewers on Free/Pro/Team; manual promotion stays the gate).
+Revisit only if self-hosting the git server becomes a requirement.
+
 ## D-008 — Production promotion is a manual `workflow_dispatch` (Accepted, 2026-11-25)
 
 **Context.** Target repos are private. On GitHub Free/Pro/Team, environment required reviewers
